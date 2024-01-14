@@ -11,7 +11,7 @@ import torchvision
 import PIL
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
-import numpy
+import numpy as np
 from numba import jit, cuda #This import is only needed if running on local NOTE: may not work on some builtins
 from timeit import default_timer as timer # used for timing model runtime
 
@@ -37,6 +37,8 @@ def process_image(image_path):
 
     total_features = torch.cat(total_features, dim=0)
     total_features.shape
+    # Save the tensor to a .npy file
+    np.save(r'C:\Users/caeden\gitrepos\meltpool_segment_and_chords\DINOV2_Model\saved_Image_process.npy', total_features.numpy())
 
     print("IMAGE PROCESS TIME : ", timer() - start)
     print(total_features.size())
@@ -94,18 +96,24 @@ def SS_pca_visual(pca_features,batch_count):
 
 def image_seperation(pca_features,pca,batch_count):
 
-    pca_features_bg = pca_features[:, 0] > 0.35  # from first histogram
-    pca_features_fg = ~pca_features_bg
+    pca_features_bg = pca_features[:, 0] > 0.35  # .35 is threshold
+    pca_features_fg = ~pca_features_bg # inverse of prior
 
+    row_column_count = batch_count // 2
     # plot the pca_features_bg
     for i in range(batch_count):
-        plt.subplot(2, 2, i + 1)
+        plt.subplot(row_column_count, row_column_count, i + 1)
         plt.imshow(pca_features_bg[
                    i * patch_h * patch_w: (i + 1) * patch_h * patch_w].reshape(
             patch_h, patch_w))
     plt.show()
 
+    print(len(pca_features_fg), total_features.shape[0])
+    print(total_features.shape)
+
     # 2nd PCA for only foreground patches
+    pca_features_fg = pca_features_fg.flatten()
+    pca.fit(total_features[pca_features_fg])
     pca.fit(total_features[pca_features_fg])
     pca_features_left = pca.transform(total_features[pca_features_fg])
 
@@ -126,7 +134,7 @@ def image_seperation(pca_features,pca,batch_count):
     # reshaping to numpy image format
     pca_features_rgb = pca_features_rgb.reshape(batch_count, patch_h, patch_w, 3)
     for i in range(batch_count):
-        plt.subplot(2, 2, i + 1)
+        plt.subplot(row_column_count, row_column_count, i + 1)
         plt.imshow(pca_features_rgb[i])
 
     plt.show()
@@ -181,12 +189,23 @@ if __name__ == "__main__":
 
     feat_dim = 1024  # vitl14
 
-    folder_path = input("Enter the path of the folder containing image files: ")
+    folder_path = input("Enter the path of the folder containing image files enter N to access saved_Image_process: ")
     # entering exact location and not folder may bring error
 
 
     batch_count = file_counter(folder_path)
-    total_features = process_image(folder_path)
+    if folder_path.lower() != "n":
+        total_features = process_image(folder_path)
+        with open("saved_batch_count.txt", "w") as file:
+            file.write(str(batch_count))
+    elif folder_path.lower() == "n":
+        # Load the tensor from the .npy file
+        loaded_array = np.load(r'C:\Users\caeden\gitrepos\meltpool_segment_and_chords\DINOV2_Model\saved_Image_process.npy')
+        # Convert the NumPy array back to a PyTorch tensor
+        total_features = torch.from_numpy(loaded_array)
+        with open("saved_batch_count.txt", "r") as file:
+            batch_count = int(file.readline().strip())
+
     pca_features,pca = pca_formatting(total_features, batch_count)
     # the prompt below is mainly used for testing
     image_displays = input("Enter H for historgram generation, "
