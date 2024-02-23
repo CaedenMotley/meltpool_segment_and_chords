@@ -1,0 +1,303 @@
+"""
+File: DINOV2_Processing.py
+Author: Caeden Motley
+Date: 1/13/24
+Description: Training dinov2 on meltpool images
+"""
+
+import sys
+
+
+sys.path.append(r'C:\Users\caeden\gitrepos\dinov2')
+import torch
+import torchvision
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+from datasets import load_dataset,Dataset, DatasetDict
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from transformers import Dinov2Model, Dinov2PreTrainedModel
+from transformers.modeling_outputs import SemanticSegmenterOutput
+import evaluate
+from torch.optim import AdamW
+from tqdm.auto import tqdm
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+## below is a a list of images and labels indexes correlate
+#immediately below contains all img paths
+#   image_paths_train = ['AlSi10Mg-Training/Training_1_crop1.png', 'AlSi10Mg-Training/Training_1_crop1_rot90.png', 'AlSi10Mg-Training/Training_1_crop1_rot180.png', 'AlSi10Mg-Training/Training_2_crop88.tif','AlSi10Mg-Training/Training_2_crop88_rot90.tif','AlSi10Mg-Training/Training_2_crop88_rot180.tif','AlSi10Mg-Training/Training_3_difficult.tif','AlSi10Mg-Training/Training_3_difficult_rot90.tif','AlSi10Mg-Training/Training_3_difficult_rot180.tif','AlSi10Mg-Training/Training_4_crop393.tif','AlSi10Mg-Training/Training_4_crop393_rot90.tif','AlSi10Mg-Training/Training_4_crop393_rot180.tif']
+#   label_paths_train = ['AlSi10Mg-Training/Training_1_mask.npy','AlSi10Mg-Training/Training_1_mask_90.npy', 'AlSi10Mg-Training/Training_1_mask_180.npy', 'AlSi10Mg-Training/Training_2_mask.npy', 'AlSi10Mg-Training/Training_2_mask_90.npy','AlSi10Mg-Training/Training_2_mask_180.npy','AlSi10Mg-Training/Training_3_mask.npy','AlSi10Mg-Training/Training_3_mask_90.npy','AlSi10Mg-Training/Training_3_mask_180.npy','AlSi10Mg-Training/Training_4_mask.npy','AlSi10Mg-Training/Training_4_mask_90.npy','AlSi10Mg-Training/Training_4_mask_180.npy' ]
+# this will contain only the 1000x1000
+image_paths_train = [ 'AlSi10Mg-Training/Training_2_crop88.tif','AlSi10Mg-Training/Training_2_crop88_rot90.tif','AlSi10Mg-Training/Training_2_crop88_rot180.tif','AlSi10Mg-Training/Training_3_difficult.tif','AlSi10Mg-Training/Training_3_difficult_rot90.tif','AlSi10Mg-Training/Training_3_difficult_rot180.tif','AlSi10Mg-Training/Training_4_crop393.tif','AlSi10Mg-Training/Training_4_crop393_rot90.tif','AlSi10Mg-Training/Training_4_crop393_rot180.tif']
+label_paths_train = ['AlSi10Mg-Training/Training_2_mask.npy', 'AlSi10Mg-Training/Training_2_mask_90.npy','AlSi10Mg-Training/Training_2_mask_180.npy','AlSi10Mg-Training/Training_3_mask.npy','AlSi10Mg-Training/Training_3_mask_90.npy','AlSi10Mg-Training/Training_3_mask_180.npy','AlSi10Mg-Training/Training_4_mask.npy','AlSi10Mg-Training/Training_4_mask_90.npy','AlSi10Mg-Training/Training_4_mask_180.npy' ]
+
+
+id2label = { # these correspond to the values in mask
+    0: "unknown and unlabeled",
+    1: "Meltpool Seperator",
+    2: "Background",
+    3: "Meltpool"
+}
+id2color = {k: list(np.random.choice(range(256), size=3)) for k,v in id2label.items()}
+
+def load_custom_dataset(image_paths, label_paths):
+    '''  loads and pushes a custome dataset to hugging face,
+     refer above for image and label paths
+
+    '''
+    dataset_dict = {'images': [], 'labels': []}
+
+    for image_path, label_path in zip(image_paths, label_paths):
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        width, height = image.size           # in theory these should always be square
+        cropped_size = width - (width % 14)  # this will be adjusted if not square
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.CenterCrop(994)
+        ])
+        # Load label from .npy file
+        label = np.load(label_path)
+
+        label = label[:994, :994]  # handles cropping labels
+
+        # Apply transformations if specified
+
+        image = transform(image)
+
+        dataset_dict['images'].append(image)
+        dataset_dict['labels'].append(label)
+    dataset = Dataset.from_dict(dataset_dict)
+
+    dataset.push_to_hub("MottsCoding/meltpools1k",
+                             token='') # I have removed the token here, feel free to update with your dataset
+def visualize_map(image, segmentation_map):
+    color_seg = np.zeros((segmentation_map.shape[0], segmentation_map.shape[1], 3), dtype=np.uint8) # height, width, 3
+    for label, color in id2color.items():
+        color_seg[segmentation_map == label, :] = color
+
+    # Show image + mask
+    img = np.array(image) * 0.5 + color_seg * 0.5
+    img = img.astype(np.uint8)
+
+    plt.figure(figsize=(15, 10))
+    plt.imshow(img)
+    plt.show()
+def my_collate_fn(inputs):
+    batch = dict()
+
+    batch["pixel_values"] = torch.stack([i[0] for i in inputs], dim=0)
+    batch["labels"] = torch.stack([i[1] for i in inputs], dim=0)
+    batch["original_images"] = [i[2] for i in inputs]
+    batch["original_segmentation_maps"] = [i[3] for i in inputs]
+
+    return batch
+
+
+
+############ begin linear classifier class ########################################
+class LinearClassifier(torch.nn.Module):
+    # changed input here to adjust for 71 by 71 (994 x994 / 14)
+    def __init__(self, in_channels, tokenW=71, tokenH=71, num_labels=1):
+        super(LinearClassifier, self).__init__()
+
+        self.in_channels = in_channels
+        self.width = tokenW
+        self.height = tokenH
+        self.classifier = torch.nn.Conv2d(in_channels, num_labels, (1,1))
+
+    def forward(self, embeddings):
+        embeddings = embeddings.reshape(-1, self.height, self.width, self.in_channels)
+        embeddings = embeddings.permute(0,3,1,2)
+
+        return self.classifier(embeddings)
+
+
+class Dinov2ForSemanticSegmentation(Dinov2PreTrainedModel):
+  def __init__(self, config):
+    super().__init__(config)
+
+    self.dinov2 = Dinov2Model(config)
+    self.classifier = LinearClassifier(config.hidden_size, 71, 71, config.num_labels)
+
+  def forward(self, pixel_values, output_hidden_states=False, output_attentions=False, labels=None):
+    # use frozen features
+    outputs = self.dinov2(pixel_values,
+                            output_hidden_states=output_hidden_states,
+                            output_attentions=output_attentions)
+    # get the patch embeddings - so we exclude the CLS token
+    patch_embeddings = outputs.last_hidden_state[:,1:,:]
+
+    # convert to logits and upsample to the size of the pixel values
+    logits = self.classifier(patch_embeddings)
+    logits = torch.nn.functional.interpolate(logits, size=pixel_values.shape[2:], mode="bilinear", align_corners=False)
+
+    loss = None
+    if labels is not None:
+      # important: we're going to use 0 here as ignore index instead of the default -100
+      # as we don't want the model to learn to predict background
+      loss_fct = torch.nn.CrossEntropyLoss(ignore_index=0)
+      loss = loss_fct(logits.squeeze(), labels.squeeze())
+
+    return SemanticSegmenterOutput(
+        loss=loss,
+        logits=logits,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
+
+
+class SegmentationDataset(Dataset):
+  def __init__(self, dataset, transform):
+    self.dataset = dataset
+    self.transform = transform
+
+  def __len__(self):
+    return len(self.dataset)
+
+  def __getitem__(self, idx):
+      item = self.dataset[idx]
+
+      original_image = np.array(item["images"])
+
+      if len(original_image.shape) not in [2, 3]:
+          original_image = original_image[:, :, :, 0]
+
+      original_segmentation_map = np.array(item["labels"])
+      transformed = self.transform(image=original_image,
+                                   mask=original_segmentation_map)
+      image, target = torch.tensor(transformed['image']), torch.IntTensor(
+          transformed['mask'])
+      target = target + 1 # bump all labels up by 1 for cross entropy loss
+      # USE BELOW IF USING TORCHVISION
+      # transformed = self.transform(original_image),self.transform(original_segmentation_map)
+      # image = transformed[0]
+      # target = transformed[1]
+
+      return image, target, original_image, original_segmentation_map
+
+
+
+def train_one_epoch(batch_list):
+    learning_rate = 5e-5
+    epochs = 10
+
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+    # put model on GPU (set runtime to GPU in Google Colab)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+
+    # put model in training mode
+    model.train()
+    epoch_progress_bar = tqdm(total=epochs, desc='Epochs')
+
+
+    for epoch in range(epochs):
+
+        print("Epoch:", epoch)
+        epoch_progress_bar.update(1)
+
+        num_of_batches = 0
+        for batch in batch_list:
+            pixel_values = batch["pixel_values"].to(device)
+            labels = batch["labels"].to(device)
+
+            # forward pass
+            outputs = model(pixel_values, labels=labels)
+            loss = outputs.loss
+
+            loss.backward()
+            optimizer.step()
+
+            # zero the parameter gradients
+            optimizer.zero_grad()
+
+            # evaluate
+            with torch.no_grad():
+                predicted = outputs.logits.argmax(dim=1)
+
+                # note that the metric expects predictions + labels as numpy arrays
+                metric.add_batch(predictions=predicted.detach().cpu().numpy(),
+                                 references=labels.detach().cpu().numpy())
+
+            # let's print loss and metrics every 100 batches
+                metrics = metric.compute(num_labels=len(id2label),
+                                         ignore_index=0,
+                                         reduce_labels=False,
+                                         )
+
+                print("Loss:", loss.item())
+                print("Mean_iou:", metrics["mean_iou"])
+                print("Mean accuracy:", metrics["mean_accuracy"])
+if __name__ == "__main__":
+    model = Dinov2ForSemanticSegmentation.from_pretrained(
+        "facebook/dinov2-base", id2label=id2label, num_labels=len(id2label))
+    for name, param in model.named_parameters():
+        if name.startswith("dinov2"):
+            param.requires_grad = False
+
+    #load_custom_dataset(image_paths_train, label_paths_train)
+    #dataset_dict = load_custom_dataset(image_paths_train, label_paths_train) uncomment this if changing a dataset or creating new
+    dataset = load_dataset("MottsCoding/meltpools1k")
+
+    #train_transform = torchvision.transforms.Compose([
+     #   torchvision.transforms.ToTensor(),
+    #])
+    train_transform = A.Compose([
+       ToTensorV2()
+    ], is_check_shapes=False)
+
+    train_dataset = SegmentationDataset(dataset["train"],
+                                        transform=train_transform)
+
+    #pixel_values, target, original_image, original_segmentation_map = train_dataset[3]
+    #visualize_map(original_image, original_segmentation_map) if you want to visualize uncomment this
+
+    #train_dataloader = DataLoader(train_dataset, batch_size=9, shuffle=True,
+                                  #collate_fn=my_collate_fn, num_workers=0)
+    batch_size = 3
+
+    batch_list = []
+    for i in range(0, len(train_dataset), batch_size):
+        batch_data = my_collate_fn([
+            train_dataset[idx] for idx in
+            range(i, min(i + batch_size, len(train_dataset)))
+        ])
+        batch_list.append(batch_data)
+    for i in range(0, batch_size):
+
+        batch_list[i]["pixel_values"] = batch_list[i]["pixel_values"].to(torch.float32)
+        batch_list[i]["labels"] = batch_list[i]["labels"].to(torch.long)
+
+    #important note the tensors must be dtypeint_32
+    outputs = model(pixel_values=batch_list[0]["pixel_values"], labels=batch_list[0]["labels"])
+    # should return a tensor with following attributes
+    # torch.Size([3, 4, 994, 994])  logits shape
+    # tensor(1.5908, grad_fn=<NllLoss2DBackward0>)     loss
+
+    metric = evaluate.load("mean_iou")
+
+    train_one_epoch(batch_list)
+
+    test_image = dataset["train"][1]["images"]
+    test_image
+    pixel_values = train_transform(image=np.array(test_image))["image"]
+    pixel_values = torch.tensor(pixel_values)
+    pixel_values = pixel_values.unsqueeze(
+        0)  # convert to (batch_size, num_channels, height, width)
+    print(pixel_values.shape)
+
+    with torch.no_grad():
+        outputs = model((pixel_values.to(torch.float32)).to(device))
+    upsampled_logits = torch.nn.functional.interpolate(outputs.logits,
+                                                       size=test_image.size[
+                                                            ::-1],
+                                                       mode="bilinear",
+                                                       align_corners=False)
+    predicted_map = upsampled_logits.argmax(dim=1)
+    visualize_map(test_image, predicted_map.squeeze().cpu())
+
