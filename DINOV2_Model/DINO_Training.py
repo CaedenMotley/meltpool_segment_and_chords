@@ -1,11 +1,14 @@
 """
-File: DINO_Training.py
+File: DINOV2_Processing.py
 Author: Caeden Motley
 Date: 1/13/24
-Description: Training dinov2 on meltpool images
+Description: Pushing images through dinov2 for features (patch_embed)
 """
-import os
 
+import os
+import sys
+
+sys.path.append(r'C:\Users\caeden\gitrepos\dinov2') # THIS WILL NEED TO BE CHANGED FOR NON LOCAL
 import torch
 import torchvision
 import PIL
@@ -16,6 +19,8 @@ from numba import jit, cuda #This import is only needed if running on local NOTE
 from timeit import default_timer as timer # used for timing model runtime
 
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 def process_image(image_path):
     ''' processes the image into tensor
 
@@ -25,23 +30,43 @@ def process_image(image_path):
     start = timer()
 
     total_features = []
-    with torch.no_grad():
+    with torch.no_grad(): # disable gradient calc
         for img_path in os.listdir(image_path):
-            img_path = os.path.join(image_path, img_path)
-            img = PIL.Image.open(img_path).convert('RGB')
-            img_t = transform1(img)
+            if(not (img_path.endswith('npy'))):
+                img_path = os.path.join(image_path, img_path)
+                img = PIL.Image.open(img_path).convert('RGB')
+                img = np.array(img)
+                img = np.moveaxis(img, -1, 0)
+                img_t = np.repeat(np.repeat(img, repeats=14, axis=1), repeats=14,axis=2) # this upscales the image to negate the patch sizing
+                img_t = torch.from_numpy(img_t).float()
+                #img_t = transform1(img) this is only needed if not upscaling
+                features_dict = dinov2_vitl14.forward_features(img_t.unsqueeze(0)) # add a dummy dimension (1) to beggining for proper formatting
+                img_name = os.path.splitext(os.path.basename(img_path))[0]
+                dir_size = os.path.splitext(os.path.basename(img_path))[1]
+                # embed depth for vitl14 = 1024
+                features = features_dict['x_norm_patchtokens']
 
-            features_dict = dinov2_vitl14.forward_features(img_t.unsqueeze(0))
-            features = features_dict['x_norm_patchtokens']
-            total_features.append(features)
+                '''
+                # uncomment below if not using upscaled image!
 
-    total_features = torch.cat(total_features, dim=0)
-    total_features.shape
+                # uses inferred features from localized images !!! wow this is much easier than hand drawing everything for data!
+                #features = features.reshape(cropped_size//patch_size, cropped_size//patch_size, 1024) 
+                f#eatures = np.repeat(np.repeat(features, repeats=14,axis=0), repeats=14, axis=1)
+                #features = features.reshape((cropped_size, cropped_size, 1024))
+                '''
+                
+                total_features.append(features)
+                np.save(r''+ image_path + '\\' f"{img_name}_features.npy",features.numpy())
+
+    # Note: the total_features below WILL NOT WORK ON MACHINES WITH LOW RAM better to comment out if unkown!
+    total_features = torch.cat(total_features, dim=0)# concactenates ALL features extracted creating a consolidated representation of all the features.
+    total_features = total_features.view(batch_count,-1, 1024)
     # Save the tensor to a .npy file
-    np.save(r'C:\Users/caeden\gitrepos\meltpool_segment_and_chords\DINOV2_Model\saved_Image_process.npy', total_features.numpy())
+    #np.save(r''+ image_path + '\\BatchTotalFeatures .npy', total_features.numpy())
 
     print("IMAGE PROCESS TIME : ", timer() - start)
     print(total_features.size())
+    print(total_features.shape)
     return total_features
 
 def pca_formatting(total_features, batch_count):
@@ -51,8 +76,8 @@ def pca_formatting(total_features, batch_count):
     :param total_features: a tensor rep of all features
     :return:  the formatted PCA features
     '''
-    total_features = total_features.reshape(batch_count * patch_h * patch_w,feat_dim)  # count(*H*w, 1024)
-
+    total_features = total_features.reshape(1 * cropped_size * cropped_size,feat_dim)  # Reshape for PCA analysis: batch_count * patch_h * patch_w x features (feat_dim)
+   # note this does not rid any features just  reformats to batch_count * patch_h * patch_w rows and feat_dim columns
     pca = PCA(n_components=3)
     pca.fit(total_features)
     pca_features = pca.transform(total_features)
@@ -84,13 +109,12 @@ def SS_pca_visual(pca_features,batch_count):
     # min_max scale
     pca_features[:, 0] = (pca_features[:, 0] - pca_features[:, 0].min()) / \
 (pca_features[:, 0].max() - pca_features[:, 0].min())
-    # pca_features = sklearn.processing.minmax_scale(pca_features)
     row_column_count = batch_count//2
-    for i in range(batch_count):
+    for i in range(1): # CHANGE THE RANGE TO BATCH COUNT IF USING BATCH > 1
         plt.subplot(row_column_count, row_column_count, i + 1)
         plt.imshow(
-            pca_features[i * patch_h * patch_w: (i + 1) * patch_h * patch_w,
-            0].reshape(patch_h, patch_w))
+            pca_features[i * cropped_size * cropped_size: (i + 1) * cropped_size * cropped_size,
+            0].reshape(cropped_size, cropped_size))
 
     plt.show()
 
@@ -101,43 +125,19 @@ def image_seperation(pca_features,pca,batch_count):
 
     row_column_count = batch_count // 2
     # plot the pca_features_bg
-    for i in range(batch_count):
+    for i in range(1): # CHANGE THE RANGE TO BATCH COUNT IF USING BATCH > 1
         plt.subplot(row_column_count, row_column_count, i + 1)
         plt.imshow(pca_features_bg[
-                   i * patch_h * patch_w: (i + 1) * patch_h * patch_w].reshape(
-            patch_h, patch_w))
+                   i * cropped_size * cropped_size: (i + 1) * cropped_size * cropped_size].reshape(
+            cropped_size, cropped_size))
     plt.show()
 
     print(len(pca_features_fg), total_features.shape[0])
     print(total_features.shape)
 
-    # 2nd PCA for only foreground patches
-    pca_features_fg = pca_features_fg.flatten()
-    pca.fit(total_features[pca_features_fg])
-    pca.fit(total_features[pca_features_fg])
-    pca_features_left = pca.transform(total_features[pca_features_fg])
 
-    for i in range(3):
-        # min_max scaling
-        pca_features_left[:, i] = (pca_features_left[:, i] - pca_features_left[
-                                                             :, i].min()) / (
-                                              pca_features_left[:,
-                                              i].max() - pca_features_left[:,
-                                                         i].min())
 
-    pca_features_rgb = pca_features.copy()
-    # for black background
-    pca_features_rgb[pca_features_bg] = 0
-    # new scaled foreground features
-    pca_features_rgb[pca_features_fg] = pca_features_left
 
-    # reshaping to numpy image format
-    pca_features_rgb = pca_features_rgb.reshape(batch_count, patch_h, patch_w, 3)
-    for i in range(batch_count):
-        plt.subplot(row_column_count, row_column_count, i + 1)
-        plt.imshow(pca_features_rgb[i])
-
-    plt.show()
 
 
 
@@ -155,9 +155,10 @@ def file_counter(folder_path):
         # Filter for image files (assuming common image extensions like jpg, png, etc.)
         image_files = [file for file in all_files if file.lower().endswith(
             ('.jpg', '.jpeg', '.png', '.gif', '.bmp','.tif'))]
+        filtered_files = [file for file in image_files if not file.endswith('.npy')]
 
         # Count the number of image files
-        number_of_items = len(image_files)
+        number_of_items = len(filtered_files)
 
         print(f'The folder contains {number_of_items} image files.')
         return number_of_items
@@ -171,21 +172,20 @@ if __name__ == "__main__":
 
     # initialize the dino model
     dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
-
-
+    size = int(input("Please input standard image size (will be cropped to be divisible by 14): "))
+    cropped_size = size - (size % 14) #994 if 1000
     transform1 = torchvision.transforms.Compose([
-        torchvision.transforms.Resize(520),
-        torchvision.transforms.CenterCrop(518),
+        torchvision.transforms.CenterCrop(cropped_size), # adjusts to handle patch size being 14
         # should be multiple of model patch_size
         torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(mean=0.5, std=0.2)
+        #torchvision.transforms.Normalize(mean=0.5, std=0.2)
     ])
 
     patch_size = dinov2_vitl14.patch_size  # patchsize=14
 
-    # 520//14
-    patch_h = 520 // patch_size
-    patch_w = 520 // patch_size
+    # 1000//14
+    patch_h = size // patch_size
+    patch_w = size // patch_size
 
     feat_dim = 1024  # vitl14
 
@@ -200,9 +200,14 @@ if __name__ == "__main__":
             file.write(str(batch_count))
     elif folder_path.lower() == "n":
         # Load the tensor from the .npy file
-        loaded_array = np.load(r'C:\Users\caeden\gitrepos\meltpool_segment_and_chords\DINOV2_Model\saved_Image_process.npy')
+        # NOTE: this will be finalized for non local machines later
+        loaded_array = np.load(r'C:\Users\caeden\gitrepos\meltpool_segment_and_chords\DINOV2_Model\Training_data\DinoV2Features\1000by1000\Training_2_crop88_features.npy') # change this for what you want to load
         # Convert the NumPy array back to a PyTorch tensor
         total_features = torch.from_numpy(loaded_array)
+        #new_tensor = total_features.view(215, 215, 1024)
+
+        print(total_features.shape)
+
         with open("saved_batch_count.txt", "r") as file:
             batch_count = int(file.readline().strip())
 
@@ -219,5 +224,5 @@ if __name__ == "__main__":
         histogram_generation(pca_features)
         SS_pca_visual(pca_features,batch_count)
 
+
     image_seperation(pca_features,pca,batch_count)
-#C:\Users\caeden\gitrepos\meltpool_segment_and_chords\Testing
